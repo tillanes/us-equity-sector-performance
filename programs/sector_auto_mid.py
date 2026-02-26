@@ -2,206 +2,380 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend
+matplotlib.use("Agg")
 import mplfinance as mpf
 import matplotlib.pyplot as plt
 import os
 import glob
+import concurrent.futures
 
-# --- Get all sector CSV files ---
-sector_files = glob.glob("../2B-10B_sector_tickers/*.csv")
-print(f"Found {len(sector_files)} sector files to process\n")
+
+# ================================
+# SETTINGS
+# ================================
+
+INPUT_DIR = "../2B-10B_sector_tickers"
+OUTPUT_CSV_DIR = "../chart_data_mid"
+OUTPUT_IMG_DIR = "../chart_pics_mid"
+
+os.makedirs(OUTPUT_CSV_DIR, exist_ok=True)
+os.makedirs(OUTPUT_IMG_DIR, exist_ok=True)
+
+
+# ================================
+# FAST + RELIABLE MARKET CAP FETCH
+# ================================
+
+def get_market_cap(ticker, adj_close):
+
+    try:
+
+        tk = yf.Ticker(ticker)
+
+        # fastest method
+        mc = tk.fast_info.get("marketCap")
+        if mc:
+            return ticker, mc
+
+        # fallback using shares
+        shares = tk.fast_info.get("sharesOutstanding")
+        if shares:
+            price = adj_close[ticker].iloc[-1]
+            return ticker, shares * price
+
+        # final fallback (slow but reliable)
+        info = tk.info
+        mc = info.get("marketCap")
+        if mc:
+            return ticker, mc
+
+    except Exception:
+        pass
+
+    return ticker, None
+
+
+# ================================
+# PROCESS FILES
+# ================================
+
+sector_files = glob.glob(f"{INPUT_DIR}/*.csv")
+
+print(f"Found {len(sector_files)} sector files\n")
+
 
 for csv_filename in sector_files:
+
     print("=" * 80)
     print(f"PROCESSING: {csv_filename}")
     print("=" * 80)
-    
+
     try:
-        # --- Step 1: Load tickers from CSV ---
-        sectorName = csv_filename.split("/")[-1].replace(".csv", "")
-        
-        tickers = pd.read_csv(csv_filename, header=None).iloc[0].dropna().tolist()
+
+        # ----------------
+        # LOAD TICKERS
+        # ----------------
+
+        base_filename = os.path.splitext(
+            os.path.basename(csv_filename)
+        )[0]
+
+        sector_name = base_filename
+
+        tickers = (
+            pd.read_csv(csv_filename, header=None)
+            .iloc[0]
+            .dropna()
+            .tolist()
+        )
+
         if len(tickers) == 1:
-            tickers = tickers[0].split(',')
-        
-        print(f"Total tickers loaded: {len(tickers)}")
-        
-        # --- Step 2: Download data ---
+            tickers = tickers[0].split(",")
+
+        tickers = [t.strip().upper() for t in tickers]
+
+        print(f"Tickers loaded: {len(tickers)}")
+
+
+        # ----------------
+        # DOWNLOAD PRICES
+        # ----------------
+
         print("Downloading price data...")
-        data = yf.download(tickers, period='180d', interval='1d', group_by='ticker', threads=True, progress=False)
-        
-        # --- Step 3: Extract Close prices only for tickers with valid data ---
-        valid_tickers = []
-        missing_tickers = []
-        
+
+        data = yf.download(
+            tickers,
+            period="180d",
+            interval="1d",
+            group_by="ticker",
+            auto_adjust=True,
+            progress=False,
+            threads=True
+        )
+
+
+        # ----------------
+        # FILTER VALID
+        # ----------------
+
+        valid = []
+        missing = []
+
         for t in tickers:
+
             try:
-                if isinstance(data.columns, pd.MultiIndex):
-                    close_data = data[t]['Close'].dropna()
+                close = data[t]["Close"].dropna()
+
+                if len(close) > 0:
+                    valid.append(t)
                 else:
-                    close_data = data['Close'].dropna()
-                
-                if len(close_data) > 0:
-                    valid_tickers.append(t)
-                else:
-                    missing_tickers.append(t)
-            except Exception:
-                missing_tickers.append(t)
-        
-        print(f"✅ Valid tickers: {len(valid_tickers)}")
-        print(f"❌ Missing or delisted tickers ({len(missing_tickers)}): {missing_tickers}")
-        
-        if len(valid_tickers) == 0:
-            print(f"⚠️ No valid tickers for {sectorName}, skipping...\n")
+                    missing.append(t)
+
+            except:
+                missing.append(t)
+
+
+        print(f"Valid tickers: {len(valid)}")
+        print(f"Missing: {missing}")
+
+
+        if len(valid) == 0:
+            print("Skipping sector\n")
             continue
-        
-        # Use only valid tickers
-        adj_close = pd.concat([data[t]['Close'] for t in valid_tickers], axis=1)
-        adj_close.columns = valid_tickers
-        
-        # --- Step 4: Get market caps safely ---
+
+
+        adj_close = pd.concat(
+            [data[t]["Close"] for t in valid],
+            axis=1
+        )
+
+        adj_close.columns = valid
+
+
+        # ----------------
+        # MARKET CAPS
+        # ----------------
+
+        print("Fetching market caps...")
+
         market_caps = {}
-        failed_caps = []
-        
-        for t in valid_tickers:
-            try:
-                info = yf.Ticker(t).info
-                mc = info.get('marketCap')
+        failed = []
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=10
+        ) as executor:
+
+            futures = [
+                executor.submit(
+                    get_market_cap,
+                    t,
+                    adj_close
+                )
+                for t in valid
+            ]
+
+            for future in concurrent.futures.as_completed(
+                futures
+            ):
+
+                ticker, mc = future.result()
+
                 if mc:
-                    market_caps[t] = mc
+                    market_caps[ticker] = mc
                 else:
-                    failed_caps.append(t)
-            except Exception:
-                failed_caps.append(t)
-        
-        print(f"✅ Market caps found: {len(market_caps)}")
-        print(f"⚠️ Failed to fetch market cap for: {failed_caps}")
-        
+                    failed.append(ticker)
+
+
+        print(f"Market caps found: {len(market_caps)}")
+        print(f"Failed caps: {failed}")
+
+
         if len(market_caps) == 0:
-            print(f"⚠️ No market caps available for {sectorName}, skipping...\n")
+            print("Skipping sector\n")
             continue
-        
-        # --- Step 5: Filter tickers to those with valid market caps ---
+
+
+        # ----------------
+        # BUILD INDEX
+        # ----------------
+
         adj_close = adj_close[list(market_caps.keys())]
-        
-        # --- Step 6: Compute index FIRST ---
-        total_mc = sum(market_caps.values())
-        weights = {t: mc / total_mc for t, mc in market_caps.items()}
-        
-        returns = adj_close.pct_change(fill_method=None).dropna()
-        weighted_returns = returns.mul(pd.Series(weights), axis=1).sum(axis=1)
+
+        weights = pd.Series(market_caps)
+        weights = weights / weights.sum()
+
+        returns = adj_close.pct_change().dropna()
+
+        weighted_returns = returns.mul(
+            weights,
+            axis=1
+        ).sum(axis=1)
+
         index = (1 + weighted_returns).cumprod() * 100
-        
-        # --- Step 7: Calculate performance metrics with correlation filter ---
-        print("\nCalculating top performers with correlation filter...")
-        
-        # Calculate correlations with the sector index
+
+
+        # ----------------
+        # CORRELATIONS
+        # ----------------
+
         correlations = {}
+
         for ticker in adj_close.columns:
-            ticker_returns = adj_close[ticker].pct_change(fill_method=None).dropna()
-            aligned_data = pd.concat([ticker_returns, weighted_returns], axis=1).dropna()
-            if len(aligned_data) > 20:
-                corr = aligned_data.iloc[:, 0].corr(aligned_data.iloc[:, 1])
+
+            r = adj_close[ticker].pct_change()
+
+            aligned = pd.concat(
+                [r, weighted_returns],
+                axis=1
+            ).dropna()
+
+            if len(aligned) > 20:
+
+                corr = aligned.iloc[:, 0].corr(
+                    aligned.iloc[:, 1]
+                )
+
                 correlations[ticker] = corr
-        
-        print(f"📊 Correlations calculated for {len(correlations)} tickers")
-        
-        # Filter tickers with at least 50% correlation
-        high_corr_tickers = [t for t, corr in correlations.items() if corr >= 0.50]
-        print(f"✅ Tickers with ≥50% correlation to sector index: {len(high_corr_tickers)}")
-        
-        if len(high_corr_tickers) == 0:
-            print(f"⚠️ No tickers with ≥50% correlation for {sectorName}, skipping...\n")
-            continue
-        
-        # Get the most recent trading day and calculate returns
-        latest_price = adj_close[high_corr_tickers].iloc[-1]
-        week_ago_price = adj_close[high_corr_tickers].iloc[-5] if len(adj_close) >= 5 else adj_close[high_corr_tickers].iloc[0]
-        month_ago_price = adj_close[high_corr_tickers].iloc[-21] if len(adj_close) >= 21 else adj_close[high_corr_tickers].iloc[0]
-        
-        # Calculate percentage changes
-        week_change = ((latest_price - week_ago_price) / week_ago_price * 100).dropna()
-        month_change = ((latest_price - month_ago_price) / month_ago_price * 100).dropna()
-        
-        # Create performance dataframe
-        performance = pd.DataFrame({
-            'Ticker': week_change.index,
-            'Week_Change_%': week_change.values,
-            'Month_Change_%': month_change.values,
-            'Correlation': [correlations[t] for t in week_change.index]
-        })
-        
-        # Top 20 for the week
-        top_week = performance.nlargest(20, 'Week_Change_%')[['Ticker', 'Week_Change_%', 'Correlation']].reset_index(drop=True)
-        top_week.index = range(1, len(top_week) + 1)
-        
-        # Top 20 for the month
-        top_month = performance.nlargest(20, 'Month_Change_%')[['Ticker', 'Month_Change_%', 'Correlation']].reset_index(drop=True)
-        top_month.index = range(1, len(top_month) + 1)
-        
-        print("\n📈 TOP 20 PERFORMERS - LAST WEEK (≥50% Correlation)")
-        print("-" * 60)
-        print(top_week.to_string())
-        
-        print("\n📈 TOP 20 PERFORMERS - LAST MONTH (≥50% Correlation)")
-        print("-" * 60)
-        print(top_month.to_string())
-        
-        print(f"\n📊 CORRELATION STATISTICS")
-        print("-" * 60)
-        print(f"Average correlation (all tickers): {np.mean(list(correlations.values())):.2%}")
-        print(f"Median correlation (all tickers): {np.median(list(correlations.values())):.2%}")
-        print(f"Min correlation: {min(correlations.values()):.2%}")
-        print(f"Max correlation: {max(correlations.values()):.2%}")
-        
-        # --- Step 8: Build synthetic OHLC for candlestick chart ---
+
+
+        high_corr = [
+            t for t, c in correlations.items()
+            if c >= 0.50
+        ]
+
+        print(
+            f"Tickers ≥50% correlation: {len(high_corr)}"
+        )
+
+
+        # ----------------
+        # PERFORMANCE
+        # ----------------
+
+        if len(high_corr) > 0:
+
+            latest = adj_close[high_corr].iloc[-1]
+            week = adj_close[high_corr].iloc[-5]
+            month = adj_close[high_corr].iloc[-21]
+
+            perf = pd.DataFrame({
+
+                "Week %":
+                    (latest / week - 1) * 100,
+
+                "Month %":
+                    (latest / month - 1) * 100,
+
+                "Correlation":
+                    [correlations[t]
+                     for t in latest.index]
+
+            })
+
+            print("\nTop weekly performers:")
+            print(
+                perf[["Week %", "Correlation"]]
+                .sort_values("Week %", ascending=False)
+                .head(10)
+                .to_string(float_format=lambda x: f"{x:.6f}")
+            )
+
+            # ---- Monthly report ----
+            print("\nTop monthly performers:")
+            print(
+                perf[["Month %", "Correlation"]]
+                .sort_values("Month %", ascending=False)
+                .head(10)
+                .to_string(float_format=lambda x: f"{x:.6f}")
+            )
+
+
+
+        # ----------------
+        # BUILD REALISTIC OHLC
+        # ----------------
+
         df = pd.DataFrame(index=index.index)
-        df['Close'] = index
-        df['Open'] = df['Close'].shift(1)
-        df['High'] = df[['Open', 'Close']].max(axis=1) * (1 + np.random.uniform(0.001, 0.002, len(df)))
-        df['Low'] = df[['Open', 'Close']].min(axis=1) * (1 - np.random.uniform(0.001, 0.002, len(df)))
+
+        df["Close"] = index
+        df["Open"] = df["Close"].shift(1)
+
+        move = (df["Close"] - df["Open"]).abs()
+
+        wick = move * 0.4
+
+        df["High"] = (
+            df[["Open", "Close"]]
+            .max(axis=1) + wick
+        )
+
+        df["Low"] = (
+            df[["Open", "Close"]]
+            .min(axis=1) - wick
+        )
+
         df.dropna(inplace=True)
-        
-        # --- Step 9: Save chart data to CSV ---
-        base_filename = os.path.splitext(os.path.basename(csv_filename))[0]
-        output_csv = f"../chart_data_mid/{base_filename}.data.csv"
-        df.to_csv(output_csv)
-        print(f"\n💾 Chart data saved to: {output_csv}")
-        
-        # --- Step 10: Create and save PNG chart ---
-        last_candle_date = df.index[-1]
-        last_candle_str = last_candle_date.strftime('%Y-%m-%d %H:%M')
-        chart_title = f'{sectorName} MA:25\nLast candle: {last_candle_str}'
-        
-        output_png = f"../chart_pics_mid/{base_filename}.png"
-        
-        # Create the plot and save
-        save_dict = dict(fname=output_png, dpi=100, bbox_inches='tight')
-        
+
+
+        # ----------------
+        # SAVE CSV
+        # ----------------
+
+        csv_out = (
+            f"{OUTPUT_CSV_DIR}/"
+            f"{sector_name}.data.csv"
+        )
+
+        df.to_csv(csv_out)
+
+        print(f"Saved CSV: {csv_out}")
+
+
+        # ----------------
+        # SAVE CHART
+        # ----------------
+
+        last_date = df.index[-1]
+
+        title = (
+            f"{sector_name} MA:25\n"
+            f"Last candle: "
+            f"{last_date.strftime('%Y-%m-%d')}"
+        )
+
+        img_out = (
+            f"{OUTPUT_IMG_DIR}/"
+            f"{sector_name}.png"
+        )
+
         mpf.plot(
             df,
-            type='candle',
-            style='charles',
-            title=chart_title,
-            ylabel='Index Value',
+            type="candle",
+            style="charles",
+            title=title,
+            ylabel="Index Value",
             mav=(25,),
             volume=False,
             figsize=(12, 6),
             tight_layout=True,
-            savefig=save_dict
+            savefig=dict(
+                fname=img_out,
+                dpi=100,
+                bbox_inches="tight"
+            )
         )
-        
-        # Close the figure to free memory
-        plt.close('all')
-        
-        print(f"📊 Chart saved to: {output_png}")
-        print(f"📅 Last candle date: {last_candle_str}")
-        print(f"\n✅ {sectorName} processed successfully!\n")
-        
+
+        plt.close("all")
+
+        print(f"Saved chart: {img_out}")
+        print("DONE\n")
+
+
     except Exception as e:
-        print(f"\n❌ ERROR processing {sectorName}: {str(e)}\n")
+
+        print(f"ERROR: {e}\n")
         continue
 
+
 print("=" * 80)
-print("ALL SECTORS PROCESSED!")
+print("ALL SECTORS PROCESSED")
