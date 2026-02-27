@@ -151,6 +151,15 @@ for csv_filename in sector_files:
 
         adj_close.columns = valid
 
+        # ---- DROP STALE TICKERS ----
+        most_recent = adj_close.apply(lambda col: col.dropna().index[-1]).max()
+        stale = [t for t in valid if (most_recent - adj_close[t].dropna().index[-1]).days > 2]
+        if stale:
+            print(f"Dropping stale tickers (old last candle): {stale}")
+            adj_close.drop(columns=stale, inplace=True)
+            valid = list(adj_close.columns)
+        # ----------------------------
+
 
         # ----------------
         # MARKET CAPS
