@@ -223,38 +223,30 @@ for csv_filename in sector_files:
         index = (1 + weighted_returns).cumprod() * 100
 
 
-        # ----------------
-        # CORRELATIONS
-        # ----------------
+ # ----------------
+# CORRELATIONS (windowed)
+# ----------------
 
-        correlations = {}
+        def compute_correlations(tickers, adj_close, weighted_returns, window):
+            correlations = {}
+            for ticker in tickers:
+                r = adj_close[ticker].pct_change()
+                aligned = pd.concat([r, weighted_returns], axis=1).dropna()
+                aligned = aligned.iloc[-window:]
+                if len(aligned) >= 3:          # <-- was > 5, now >= 3
+                    corr = aligned.iloc[:, 0].corr(aligned.iloc[:, 1])
+                    if not np.isnan(corr):     # <-- only store valid results
+                        correlations[ticker] = corr
+            return correlations
 
-        for ticker in adj_close.columns:
+        weekly_corr  = compute_correlations(adj_close.columns, adj_close, weighted_returns, window=5)
+        monthly_corr = compute_correlations(adj_close.columns, adj_close, weighted_returns, window=21)
 
-            r = adj_close[ticker].pct_change()
+        # Filter to ≥0.50 using the FULL-period correlation (as before) for index membership
+        full_corr = compute_correlations(adj_close.columns, adj_close, weighted_returns, window=len(weighted_returns))
+        high_corr = [t for t, c in full_corr.items() if c >= 0.50]
 
-            aligned = pd.concat(
-                [r, weighted_returns],
-                axis=1
-            ).dropna()
-
-            if len(aligned) > 20:
-
-                corr = aligned.iloc[:, 0].corr(
-                    aligned.iloc[:, 1]
-                )
-
-                correlations[ticker] = corr
-
-
-        high_corr = [
-            t for t, c in correlations.items()
-            if c >= 0.50
-        ]
-
-        print(
-            f"Tickers ≥50% correlation: {len(high_corr)}"
-        )
+        print(f"Tickers ≥50% correlation (full period): {len(high_corr)}")
 
 
         # ----------------
@@ -264,36 +256,29 @@ for csv_filename in sector_files:
         if len(high_corr) > 0:
 
             latest = adj_close[high_corr].iloc[-1]
-            week = adj_close[high_corr].iloc[-5]
-            month = adj_close[high_corr].iloc[-21]
+            week   = adj_close[high_corr].iloc[-5]
+            month  = adj_close[high_corr].iloc[-21]
 
-            perf = pd.DataFrame({
+            weekly_perf = pd.DataFrame({
+                "Week %":      (latest / week - 1) * 100,
+                "Corr (5d)":   [weekly_corr.get(t, float("nan")) for t in latest.index],
+            })
 
-                "Week %":
-                    (latest / week - 1) * 100,
-
-                "Month %":
-                    (latest / month - 1) * 100,
-
-                "Correlation":
-                    [correlations[t]
-                     for t in latest.index]
-
+            monthly_perf = pd.DataFrame({
+                "Month %":     (latest / month - 1) * 100,
+                "Corr (21d)":  [monthly_corr.get(t, float("nan")) for t in latest.index],
             })
 
             print("\nTop weekly performers:")
             print(
-                perf[["Week %", "Correlation"]]
-                .sort_values("Week %", ascending=False)
+                weekly_perf.sort_values("Week %", ascending=False)
                 .head(10)
                 .to_string(float_format=lambda x: f"{x:.6f}")
             )
 
-            # ---- Monthly report ----
             print("\nTop monthly performers:")
             print(
-                perf[["Month %", "Correlation"]]
-                .sort_values("Month %", ascending=False)
+                monthly_perf.sort_values("Month %", ascending=False)
                 .head(10)
                 .to_string(float_format=lambda x: f"{x:.6f}")
             )
